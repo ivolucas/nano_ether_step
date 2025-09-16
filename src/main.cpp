@@ -1,275 +1,219 @@
 #include <Arduino.h>
 #include <SPI.h>
-#include <UIPEthernet.h> // For ENC28J60
+#include <UIPEthernet.h> // ENC28J60 support
 #include <UIPUdp.h>
-#include <AccelStepper.h>
 
-// ------------------ Hardware Config ------------------
-#define SENSOR_PIN 3
+// ------------------ Hardware ------------------
+#define SENSOR_PIN 3 // attach sensor to D2 (INT0) !!
 
-#define IN1 4 // L298N IN1
-#define IN2 5 // L298N IN2
-#define IN3 6 // L298N IN3
-#define IN4 7 // L298N IN4
-
-#define ENA 5
-#define ENB 6
-
-// logical sensor (marker at 0°)
-
-// Stepper setup (4-wire)
-AccelStepper stepper(AccelStepper::FULL2WIRE, IN1, IN3, IN2, IN4);
-
-// ------------------ Ethernet Config ------------------
+// ------------------ Ethernet (ENC28J60) ------------------
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
-unsigned int localPort = 8888;
-
+unsigned int LOCAL_PORT = 8888;
 EthernetUDP Udp;
 IPAddress remoteIp;
 unsigned int remotePort;
 
-// ------------------ Variables ------------------
-volatile bool zeroMarked = false;
-volatile uint16_t stepsPerRevolution = 0;
-volatile bool calibrated = false;
+// ------------------ Measurement variables (shared with ISR) ------------------
+volatile unsigned long lastPulseMicros = 0;   // timestamp of last pulse (micros)
+volatile unsigned long prevPulseMicros = 0;   // previous pulse timestamp
+volatile unsigned long revDurationMicros = 0; // measured revolution duration in micros (0 = unknown)
+volatile unsigned int pulseCount = 0;         // count pulses (for diagnostics)
+
+// ------------------ Control flags ------------------
 bool streaming = false;
-bool running = false;
-int powerLevel = 200; // 0-255
-char lastCmd[10] = "";
+unsigned long lastStreamSent = 0;
+volatile unsigned long streamInterval = 20;
 
-// ------------------ Functions ------------------
-void setMotorPower(uint8_t level)
+// small buffer for last command (store ASCII)
+char lastCmd[12] = "";
+
+// ------------------ ISR: on rising edge of sensor ------------------
+void isrMarker()
 {
-  // level: 0–255 (PWM duty cycle)
-  analogWrite(ENA, level);
-  analogWrite(ENB, level);
-}
+  unsigned long t = micros();
 
-void enableMotor()
-{
-  setMotorPower(powerLevel);
-}
+  Serial.println("isrMarker");
+  // shift timestamps
 
-void disableMotor()
-{
-  setMotorPower(0);
-}
-
-void calibrateStepper()
-{
-  enableMotor();
-  Serial.print("Calibration start");
-  stepper.setCurrentPosition(0);
-  stepper.stop();
-  calibrated = false;
-  zeroMarked = false;
-  stepper.setSpeed(200);
-
-  while (!zeroMarked)
+  if (lastPulseMicros != 0)
   {
-    stepper.runSpeed();
+    // compute duration between consecutive pulses (revolution time)
+    unsigned long duration = t - lastPulseMicros;
+    Serial.print("Rev dur: ");
+    Serial.println(duration);
+    // basic sanity check: ignore too-small/too-large spikes
+    if (duration > 100000UL && duration < 60UL * 1000000UL)
+    { // >5ms and <60s
+      pulseCount++;
+      revDurationMicros = duration;
+      prevPulseMicros = lastPulseMicros;
+      lastPulseMicros = t;
+      //streamInterval = revDurationMicros / 360; 
+    }
+    // else keep previous revDurationMicros
   }
-  Serial.println("Zero Found");
-  stepper.setSpeed(200);
-  while (!calibrated)
-    stepper.runSpeed();
-
-  Serial.println("Steps/rev: ");
-  Serial.println(stepsPerRevolution);
-  disableMotor();
+  else
+  {
+    // first pulse
+    lastPulseMicros = t;
+  }
 }
 
-void sendPosition()
-{
-  if (!calibrated)
-    return;
-
-  long stepPos = stepper.currentPosition() % stepsPerRevolution;
-  if (stepPos < 0)
-    stepPos += stepsPerRevolution;
-
-  float degrees = (360.0 * stepPos) / stepsPerRevolution;
-
-  char reply[50];
-  snprintf(reply, sizeof(reply), "POS: %.2f deg (%ld steps)", degrees, stepPos);
-
-  Udp.beginPacket(remoteIp, remotePort);
-  Udp.write(reply);
-  Udp.endPacket();
-}
-
+// ------------------ Helpers ------------------
 void sendText(const char *msg)
 {
+  if (remotePort == 0)
+    return; // no known client
   Udp.beginPacket(remoteIp, remotePort);
   Udp.write(msg);
   Udp.endPacket();
 }
 
+void sendPositionOnce()
+{
+  // compute position in integer degrees
+  unsigned long revDur;
+  unsigned long lastPulse;
+  // copy volatile to local atomically
+  noInterrupts();
+  revDur = revDurationMicros;
+  lastPulse = lastPulseMicros;
+  interrupts();
+
+  if (revDur == 0 || lastPulse == 0)
+  {
+    sendText("P:NA"); // no measurement yet
+    return;
+  }
+
+  unsigned long now = micros();
+  unsigned long elapsed;
+  if (now >= lastPulse)
+    elapsed = now - lastPulse;
+  else
+
+  {
+    sendText("P:NA"); // no measurement yet
+
+    return;
+  }
+
+  // wrap elapsed inside one revolution
+  if (revDur != 0)
+    elapsed = elapsed % revDur;
+
+  // compute integer degrees: (elapsed * 360) / revDur
+  // use 32-bit math; intermediate multiplication may overflow if values big -> do 64-bit
+  unsigned long deg = (unsigned long)(((unsigned long long)elapsed * 360ULL) / (unsigned long long)revDur);
+
+  char buf[32];
+  // also send rev duration in ms and pulse count (optional)
+  unsigned long revMs = revDur / 1000UL;
+  snprintf(buf, sizeof(buf), "P:%lu D:%lums C:%u", deg, revMs, pulseCount);
+  sendText(buf);
+}
+
+// ------------------ UDP handling ------------------
 void handleUDP()
 {
   int packetSize = Udp.parsePacket();
-  if (packetSize)
+  if (packetSize > 0)
   {
+    char incoming[packetSize + 1];
+    int len = Udp.read(incoming, packetSize);
+    if (len < 0)
+      return;
+    incoming[len] = 0;
+
+    // store remote for later replies / streaming
     remoteIp = Udp.remoteIP();
     remotePort = Udp.remotePort();
-
-    char incoming[packetSize + 1];
-    Udp.read(incoming, packetSize);
-    incoming[packetSize] = 0;
-
+    Serial.print("UDP from ");
+    Serial.print(remoteIp);
+    Serial.print(":");
+    Serial.print(remotePort);
+    Serial.print(" - ");
+    // store lastCmd safely
     strncpy(lastCmd, incoming, sizeof(lastCmd) - 1);
-    lastCmd[sizeof(lastCmd) - 1] = 0;
-
-    char cmd = incoming[0]; // first letter = command
-
+    lastCmd[sizeof(lastCmd) - 1] = '\0';
+    Serial.println(lastCmd);
+    char cmd = incoming[0];
     switch (cmd)
     {
-    case 'S':                                     // Start
-      stepper.setSpeed(stepsPerRevolution / 2.0); // 1 rev / 2 sec
-      enableMotor();
-      running = true;
+    case 'P': // position query
+      sendPositionOnce();
+      break;
+
+    case 'O': // stream ON
       streaming = true;
+      // acknowledge
+      sendText("O_OK");
       break;
 
-    case 'X': // Stop
-      disableMotor();
-      running = false;
-      break;
-
-    case 'V':
-    { // Speed in deg/s
-      int degPerSec = atoi(incoming + 1);
-      float stepsPerSec = (degPerSec / 360.0) * stepsPerRevolution;
-      stepper.setSpeed(stepsPerSec);
-      enableMotor();
-      running = true;
-      streaming = true;
-      break;
-    }
-
-    case 'P': // Position query
-      sendPosition();
-      break;
-
-    case 'O': // Stream ON
-      streaming = true;
-      break;
-
-    case 'F': // Stream OFF
+    case 'F': // stream OFF
       streaming = false;
+      sendText("F_OK");
       break;
 
-    case 'R': // Reset
-      enableMotor();
-      running = false;
-      streaming = false;
-      calibrateStepper();
+    case 'R': // reset measured duration and counters
+      noInterrupts();
+      revDurationMicros = 0;
+      lastPulseMicros = 0;
+      prevPulseMicros = 0;
+      pulseCount = 0;
+      interrupts();
       sendText("R_OK");
       break;
+
+    default:
+      // if command starts with 'V' we could set an assumed speed? not relevant here
+      sendText("UNK");
+      break;
     }
   }
 }
 
-// ------------------ ISR ------------------
-void isrMarker()
+void streamIfNeeded()
 {
-  Serial.println("sensor");
-  if (!calibrated)
+  if (!streaming)
+    return;
+  unsigned long nowMs = millis();
+  if (nowMs - lastStreamSent >= streamInterval)
   {
-    if (zeroMarked && stepper.currentPosition() > 20)
-    {
-      calibrated = true;
-      stepsPerRevolution = stepper.currentPosition();
-    }
-    else
-    {
-      zeroMarked = true;
-      stepper.setCurrentPosition(0);
-    }
+    sendPositionOnce();
+    lastStreamSent = nowMs;
   }
 }
 
-// ------------------ Setup ------------------
+// ------------------ Setup & loop ------------------
 void setup()
 {
-
-  TCCR0B = TCCR0B & B11111000 | B00000001; // for PWM frequency of 62500.00 Hz on D5 and D6
-  setMotorPower(0); // motor off
+  // sensor pin must be on INT0 (D3) for attachInterrupt(INT0 ...)
   pinMode(SENSOR_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), isrMarker, RISING);
 
-  Serial.begin(9600);
+  Serial.begin(115200);
+  Serial.println(F("Index-only position tracker starting..."));
 
-  Serial.println("DHCP begin");
-  // ENC28J60 with DHCP
+  // ENC28J60 DHCP
   if (Ethernet.begin(mac) == 0)
   {
-    Serial.println("DHCP failed, fallback IP");
+    Serial.println(F("DHCP failed - using fallback IP 192.168.1.177"));
     IPAddress ip(192, 168, 1, 177);
     Ethernet.begin(mac, ip);
   }
-
-  switch (Ethernet.linkStatus())
-  {
-  case Unknown:
-    Serial.println("Ethernet Link Status: Unknown");
-    break;
-  case LinkON:
-    Serial.println("Ethernet Link Status: LinkON");
-    break;
-  case LinkOFF:
-    Serial.println("Ethernet Link Status: LinkOFF");
-    break;
-  default:
-    break;
-  }
-
-  switch (Ethernet.hardwareStatus())
-  {
-  case EthernetW5100:
-    Serial.println("Ethernet Hardware Status: EthernetW5100");
-    break;
-  case EthernetW5200:
-    Serial.println("Ethernet Hardware Status: EthernetW5200");
-    break;
-  case EthernetW5500:
-    Serial.println("Ethernet Hardware Status: EthernetW5500");
-    break;
-  case EthernetENC28J60:
-    Serial.println("Ethernet Hardware Status: EthernetENC28J60");
-    break;
-  default:
-    Serial.println("Ethernet Hardware Status: EthernetNoHardware");
-    break;
-  }
-
-  delay(1000);
-  Serial.print("IP: ");
+  delay(500);
+  Serial.print(F("IP: "));
   Serial.println(Ethernet.localIP());
-  Udp.begin(localPort);
 
-  Udp.begin(localPort);
-
-  stepper.setMaxSpeed(500);
-  stepper.setAcceleration(500);
-
-  calibrateStepper();
-
-  Serial.println("Setup complete");
+  Udp.begin(LOCAL_PORT);
+  Serial.print(F("UDP listening on port "));
+  Serial.println(LOCAL_PORT);
 }
 
-// ------------------ Loop ------------------
 void loop()
 {
   handleUDP();
-
-  if (running)
-  {
-    stepper.runSpeed();
-  }
-
-  if (streaming)
-  {
-    sendPosition();
-  }
+  streamIfNeeded();
+  // nothing else to do; keep loop small and responsive
 }
